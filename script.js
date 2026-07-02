@@ -1,257 +1,178 @@
-// ===============================
-// ServiceNow Log Analyzer (FINAL)
-// ===============================
+document.getElementById('fileInput').addEventListener('change', function (event) {
 
-// DOM Elements
-const logInput = document.getElementById("logInput");
-const analyzeButton = document.getElementById("analyzeButton");
-const clearButton = document.getElementById("clearButton");
+  const file = event.target.files[0];
+  if (!file) return;
 
-const resultsBody = document.getElementById("resultsBody");
+  const reader = new FileReader();
 
-const totalExportsEl = document.getElementById("totalExports");
-const successCountEl = document.getElementById("successCount");
-const warningCountEl = document.getElementById("warningCount");
-const failedCountEl = document.getElementById("failedCount");
+  reader.onload = function (e) {
 
+    const lines = e.target.result.split(/\r?\n/);
 
-// ===============================
-// EVENT LISTENERS
-// ===============================
+    const requiredPhrases = [
+      'SNOW-FLOW service',
+      'SERVICE NOW QUERY SESSION BEGIN'
+    ];
 
-analyzeButton.addEventListener("click", function () {
+    const fileIsValid = requiredPhrases.every(phrase =>
+      lines.some(line => line.includes(phrase))
+    );
 
-    const logText = logInput.value;
+    const resultBox = document.getElementById('resultBox');
+    const output = document.getElementById('output');
+    const detailsSection = document.getElementById('detailsSection');
+    const table = document.getElementById('detailsTable');
+    const exportDateSpan = document.getElementById('exportDate');
+    const sessionSummarySpan = document.getElementById('sessionSummary');
+    const tableBody = document.querySelector('#detailsTable tbody');
 
-    const exports = parseLog(logText);
+    resultBox.classList.remove('success');
+    resultBox.style.display = 'block';
+    detailsSection.style.display = 'none';
+    table.style.display = 'none';
+    exportDateSpan.textContent = '';
+    sessionSummarySpan.textContent = '';
+    tableBody.innerHTML = '';
 
-    const analyzed = analyzeExports(exports);
-
-    renderTable(analyzed);
-
-    updateSummary(analyzed);
-
-});
-
-
-clearButton.addEventListener("click", function () {
-
-    logInput.value = "";
-
-    resultsBody.innerHTML = "";
-
-    totalExportsEl.textContent = "0";
-    successCountEl.textContent = "0";
-    warningCountEl.textContent = "0";
-    failedCountEl.textContent = "0";
-
-});
-
-
-// ===============================
-// PARSER
-// ===============================
-
-function parseLog(logText) {
-
-    const lines = logText.split("\n");
-
-    const exports = [];
-
-    let currentExport = null;
-
-    for (let line of lines) {
-
-        // Detect export section
-        if (line.includes("---------------------------")) {
-
-            const match = line.match(/---------------------------\s+(.+?)\s+\(/);
-
-            if (match) {
-
-                currentExport = {
-                    name: match[1],
-                    table: "",
-                    declaredRows: 0,
-                    receivedRows: 0,
-                    portions: 0,
-                    leftRows: null,
-                    completed: false,
-                    status: "Unknown"
-                };
-
-                exports.push(currentExport);
-            }
-        }
-
-        if (!currentExport) continue;
-
-        // TABLE + DECLARED
-        if (line.includes("TABLE=")) {
-
-            const tableMatch = line.match(/TABLE=([^;]+)/);
-            if (tableMatch) currentExport.table = tableMatch[1];
-
-            const declaredMatch = line.match(/DECLARED_ROWS=(\d+)/);
-            if (declaredMatch) currentExport.declaredRows = parseInt(declaredMatch[1]);
-        }
-
-        // PORTION data
-        if (line.includes("PORTION=")) {
-
-            const portionMatch = line.match(/PORTION=(\d+)/);
-            if (portionMatch) currentExport.portions = parseInt(portionMatch[1]);
-
-            const receivedMatch = line.match(/RECEIVED=(\d+)/);
-            if (receivedMatch) {
-                currentExport.receivedRows += parseInt(receivedMatch[1]);
-            }
-
-            const leftMatch = line.match(/LEFT=(-?\d+)/);
-            if (leftMatch) currentExport.leftRows = parseInt(leftMatch[1]);
-        }
-
-        // Completion detection
-        if (line.includes("loading of") && line.includes("is done")) {
-            currentExport.completed = true;
-        }
+    if (!fileIsValid) {
+      output.textContent = '❌ Invalid file. Please upload a valid ServiceNow export log.';
+      return;
     }
 
-    return exports;
-}
+    const nameRegex = /\.\.\.NAME=([A-Z0-9_]+);\s*TABLE=([a-zA-Z0-9_]+);\s*DECLARED_ROWS=(\d+)/;
+    const portionRegex = /PORTION=\d+;\s*RECEIVED=\d+.*LEFT=(-?\d+)/;
+    const endRegex = /loading of ([A-Z0-9_]+) is done/i;
+    const dateRegex = /Date\s*:\s*(.+)/;
 
+    const sectionStates = {};
+    const details = [];
 
-// ===============================
-// ANALYSIS ENGINE (FINAL FIXED)
-// ===============================
+    let currentSection = null;
+    let exportDate = '';
 
-function analyzeExports(exports) {
+    for (const raw of lines) {
 
-    let success = 0;
-    let warning = 0;
-    let failed = 0;
+      const line = raw.trim();
 
-    for (const exp of exports) {
+      const dateMatch = line.match(dateRegex);
+      if (dateMatch) {
+        exportDate = dateMatch[1];
+      }
 
-        // ===============================
-        // SPECIAL CASE: SERVICE_COMMITMENT
-        // ===============================
-        if (exp.name && exp.name.includes("SERVICE_COMMITMENT")) {
+      const nameMatch = line.match(nameRegex);
 
-            if (exp.leftRows === 0) {
-                exp.status = "Success";
-                success++;
-            } else {
-                exp.status = "Warning";
-                warning++;
-            }
+      if (nameMatch) {
 
-            continue;
+        const name = nameMatch[1];
+        const table = nameMatch[2];
+        const declaredRows = nameMatch[3];
+
+        sectionStates[name] = {
+          started: true,
+          ended: false,
+          lastLeft: null
+        };
+
+        currentSection = name;
+
+        if (!details.some(d => d.name === name)) {
+          details.push({ name, table, declaredRows });
         }
 
-        // ===============================
-        // NORMAL EXPORTS
-        // ===============================
+        continue;
+      }
 
-        if (!exp.completed) {
-            exp.status = "Failed";
-            failed++;
-            continue;
+      const portionMatch = line.match(portionRegex);
+
+      if (portionMatch && currentSection) {
+
+        const left = parseInt(portionMatch[1]);
+        sectionStates[currentSection].lastLeft = left;
+
+        continue;
+      }
+
+      const endMatch = line.match(endRegex);
+
+      if (endMatch) {
+
+        const name = endMatch[1];
+
+        if (sectionStates[name]) {
+
+          sectionStates[name].ended = true;
+
+          const left = sectionStates[name].lastLeft;
+
+          if (left !== null && left > 0) {
+            sectionStates[name].invalidEnding = true;
+          }
+
         }
 
-        if (exp.leftRows === 0) {
-            exp.status = "Success";
-            success++;
-            continue;
-        }
+        currentSection = null;
 
-        if (exp.leftRows === -1) {
+      }
 
-            if (
-                exp.declaredRows > 0 &&
-                exp.receivedRows >= exp.declaredRows * 0.95
-            ) {
-                exp.status = "Success";
-                success++;
-            } else {
-                exp.status = "Warning";
-                warning++;
-            }
-
-            continue;
-        }
-
-        if (exp.leftRows > 0) {
-            exp.status = "Warning";
-            warning++;
-            continue;
-        }
-
-        // fallback
-        exp.status = "Warning";
-        warning++;
     }
 
-    return {
-        exports,
-        summary: {
-            total: exports.length,
-            success,
-            warning,
-            failed
-        }
-    };
-}
+    const problemSections = Object.entries(sectionStates)
+      .filter(([_, state]) => {
 
+        if (!state.started) return false;
 
-// ===============================
-// TABLE RENDERING
-// ===============================
+        if (state.ended && !state.invalidEnding) return false;
 
-function renderTable(data) {
+        if (!state.ended && state.lastLeft === 0) return false;
 
-    resultsBody.innerHTML = "";
+        return true;
 
-    if (!data.exports.length) {
-        resultsBody.innerHTML = `
-            <tr>
-                <td colspan="7" class="empty">No exports found</td>
-            </tr>
-        `;
-        return;
+      })
+      .map(([name]) => name);
+
+    if (problemSections.length === 0) {
+
+      resultBox.classList.add('success');
+      output.textContent = '✅ All sections completed correctly!';
+
+    } else {
+
+      output.textContent =
+        `❌ Found ${problemSections.length} section(s) with issues:\n\n` +
+        problemSections.map(name => ` - ${name}`).join('\n');
+
     }
 
-    for (let exp of data.exports) {
+    if (exportDate) {
+      exportDateSpan.textContent = exportDate;
+    }
 
-        const row = document.createElement("tr");
+    sessionSummarySpan.textContent = 'Session completed (no explicit end message in log).';
 
-        if (exp.status === "Success") row.classList.add("success-row");
-        if (exp.status === "Warning") row.classList.add("warning-row");
-        if (exp.status === "Failed") row.classList.add("failed-row");
+    if (details.length > 0) {
 
-        row.innerHTML = `
-            <td>${exp.name}</td>
-            <td>${exp.table}</td>
-            <td>${exp.declaredRows}</td>
-            <td>${exp.receivedRows}</td>
-            <td>${exp.portions}</td>
-            <td>${exp.leftRows}</td>
-            <td><span class="badge ${exp.status.toLowerCase()}">${exp.status}</span></td>
+      detailsSection.style.display = 'block';
+      table.style.display = 'table';
+
+      details.forEach((row, index) => {
+
+        const tr = document.createElement('tr');
+
+        tr.innerHTML = `
+          <td>${index + 1}</td>
+          <td>${row.name.toLowerCase()}</td>
+          <td>${row.table}</td>
+          <td>${row.declaredRows}</td>
         `;
 
-        resultsBody.appendChild(row);
+        tableBody.appendChild(tr);
+
+      });
+
     }
-}
 
+  };
 
-// ===============================
-// SUMMARY
-// ===============================
+  reader.readAsText(file);
 
-function updateSummary(data) {
-
-    totalExportsEl.textContent = data.summary.total;
-    successCountEl.textContent = data.summary.success;
-    warningCountEl.textContent = data.summary.warning;
-    failedCountEl.textContent = data.summary.failed;
-}
+});
