@@ -1,178 +1,257 @@
-document.getElementById('fileInput').addEventListener('change', function (event) {
+// ===============================
+// ServiceNow Log Analyzer (FINAL)
+// ===============================
 
-  const file = event.target.files[0];
-  if (!file) return;
+// DOM Elements
+const logInput = document.getElementById("logInput");
+const analyzeButton = document.getElementById("analyzeButton");
+const clearButton = document.getElementById("clearButton");
 
-  const reader = new FileReader();
+const resultsBody = document.getElementById("resultsBody");
 
-  reader.onload = function (e) {
+const totalExportsEl = document.getElementById("totalExports");
+const successCountEl = document.getElementById("successCount");
+const warningCountEl = document.getElementById("warningCount");
+const failedCountEl = document.getElementById("failedCount");
 
-    const lines = e.target.result.split(/\r?\n/);
 
-    const requiredPhrases = [
-      'SNOW-FLOW service',
-      'SERVICE NOW QUERY SESSION BEGIN'
-    ];
+// ===============================
+// EVENT LISTENERS
+// ===============================
 
-    const fileIsValid = requiredPhrases.every(phrase =>
-      lines.some(line => line.includes(phrase))
-    );
+analyzeButton.addEventListener("click", function () {
 
-    const resultBox = document.getElementById('resultBox');
-    const output = document.getElementById('output');
-    const detailsSection = document.getElementById('detailsSection');
-    const table = document.getElementById('detailsTable');
-    const exportDateSpan = document.getElementById('exportDate');
-    const sessionSummarySpan = document.getElementById('sessionSummary');
-    const tableBody = document.querySelector('#detailsTable tbody');
+    const logText = logInput.value;
 
-    resultBox.classList.remove('success');
-    resultBox.style.display = 'block';
-    detailsSection.style.display = 'none';
-    table.style.display = 'none';
-    exportDateSpan.textContent = '';
-    sessionSummarySpan.textContent = '';
-    tableBody.innerHTML = '';
+    const exports = parseLog(logText);
 
-    if (!fileIsValid) {
-      output.textContent = '❌ Invalid file. Please upload a valid ServiceNow export log.';
-      return;
-    }
+    const analyzed = analyzeExports(exports);
 
-    const nameRegex = /\.\.\.NAME=([A-Z0-9_]+);\s*TABLE=([a-zA-Z0-9_]+);\s*DECLARED_ROWS=(\d+)/;
-    const portionRegex = /PORTION=\d+;\s*RECEIVED=\d+.*LEFT=(-?\d+)/;
-    const endRegex = /loading of ([A-Z0-9_]+) is done/i;
-    const dateRegex = /Date\s*:\s*(.+)/;
+    renderTable(analyzed);
 
-    const sectionStates = {};
-    const details = [];
-
-    let currentSection = null;
-    let exportDate = '';
-
-    for (const raw of lines) {
-
-      const line = raw.trim();
-
-      const dateMatch = line.match(dateRegex);
-      if (dateMatch) {
-        exportDate = dateMatch[1];
-      }
-
-      const nameMatch = line.match(nameRegex);
-
-      if (nameMatch) {
-
-        const name = nameMatch[1];
-        const table = nameMatch[2];
-        const declaredRows = nameMatch[3];
-
-        sectionStates[name] = {
-          started: true,
-          ended: false,
-          lastLeft: null
-        };
-
-        currentSection = name;
-
-        if (!details.some(d => d.name === name)) {
-          details.push({ name, table, declaredRows });
-        }
-
-        continue;
-      }
-
-      const portionMatch = line.match(portionRegex);
-
-      if (portionMatch && currentSection) {
-
-        const left = parseInt(portionMatch[1]);
-        sectionStates[currentSection].lastLeft = left;
-
-        continue;
-      }
-
-      const endMatch = line.match(endRegex);
-
-      if (endMatch) {
-
-        const name = endMatch[1];
-
-        if (sectionStates[name]) {
-
-          sectionStates[name].ended = true;
-
-          const left = sectionStates[name].lastLeft;
-
-          if (left !== null && left > 0) {
-            sectionStates[name].invalidEnding = true;
-          }
-
-        }
-
-        currentSection = null;
-
-      }
-
-    }
-
-    const problemSections = Object.entries(sectionStates)
-      .filter(([_, state]) => {
-
-        if (!state.started) return false;
-
-        if (state.ended && !state.invalidEnding) return false;
-
-        if (!state.ended && state.lastLeft === 0) return false;
-
-        return true;
-
-      })
-      .map(([name]) => name);
-
-    if (problemSections.length === 0) {
-
-      resultBox.classList.add('success');
-      output.textContent = '✅ All sections completed correctly!';
-
-    } else {
-
-      output.textContent =
-        `❌ Found ${problemSections.length} section(s) with issues:\n\n` +
-        problemSections.map(name => ` - ${name}`).join('\n');
-
-    }
-
-    if (exportDate) {
-      exportDateSpan.textContent = exportDate;
-    }
-
-    sessionSummarySpan.textContent = 'Session completed (no explicit end message in log).';
-
-    if (details.length > 0) {
-
-      detailsSection.style.display = 'block';
-      table.style.display = 'table';
-
-      details.forEach((row, index) => {
-
-        const tr = document.createElement('tr');
-
-        tr.innerHTML = `
-          <td>${index + 1}</td>
-          <td>${row.name.toLowerCase()}</td>
-          <td>${row.table}</td>
-          <td>${row.declaredRows}</td>
-        `;
-
-        tableBody.appendChild(tr);
-
-      });
-
-    }
-
-  };
-
-  reader.readAsText(file);
+    updateSummary(analyzed);
 
 });
+
+
+clearButton.addEventListener("click", function () {
+
+    logInput.value = "";
+
+    resultsBody.innerHTML = "";
+
+    totalExportsEl.textContent = "0";
+    successCountEl.textContent = "0";
+    warningCountEl.textContent = "0";
+    failedCountEl.textContent = "0";
+
+});
+
+
+// ===============================
+// PARSER
+// ===============================
+
+function parseLog(logText) {
+
+    const lines = logText.split("\n");
+
+    const exports = [];
+
+    let currentExport = null;
+
+    for (let line of lines) {
+
+        // Detect export section
+        if (line.includes("---------------------------")) {
+
+            const match = line.match(/---------------------------\s+(.+?)\s+\(/);
+
+            if (match) {
+
+                currentExport = {
+                    name: match[1],
+                    table: "",
+                    declaredRows: 0,
+                    receivedRows: 0,
+                    portions: 0,
+                    leftRows: null,
+                    completed: false,
+                    status: "Unknown"
+                };
+
+                exports.push(currentExport);
+            }
+        }
+
+        if (!currentExport) continue;
+
+        // TABLE + DECLARED
+        if (line.includes("TABLE=")) {
+
+            const tableMatch = line.match(/TABLE=([^;]+)/);
+            if (tableMatch) currentExport.table = tableMatch[1];
+
+            const declaredMatch = line.match(/DECLARED_ROWS=(\d+)/);
+            if (declaredMatch) currentExport.declaredRows = parseInt(declaredMatch[1]);
+        }
+
+        // PORTION data
+        if (line.includes("PORTION=")) {
+
+            const portionMatch = line.match(/PORTION=(\d+)/);
+            if (portionMatch) currentExport.portions = parseInt(portionMatch[1]);
+
+            const receivedMatch = line.match(/RECEIVED=(\d+)/);
+            if (receivedMatch) {
+                currentExport.receivedRows += parseInt(receivedMatch[1]);
+            }
+
+            const leftMatch = line.match(/LEFT=(-?\d+)/);
+            if (leftMatch) currentExport.leftRows = parseInt(leftMatch[1]);
+        }
+
+        // Completion detection
+        if (line.includes("loading of") && line.includes("is done")) {
+            currentExport.completed = true;
+        }
+    }
+
+    return exports;
+}
+
+
+// ===============================
+// ANALYSIS ENGINE (FINAL FIXED)
+// ===============================
+
+function analyzeExports(exports) {
+
+    let success = 0;
+    let warning = 0;
+    let failed = 0;
+
+    for (const exp of exports) {
+
+        // ===============================
+        // SPECIAL CASE: SERVICE_COMMITMENT
+        // ===============================
+        if (exp.name && exp.name.includes("SERVICE_COMMITMENT")) {
+
+            if (exp.leftRows === 0) {
+                exp.status = "Success";
+                success++;
+            } else {
+                exp.status = "Warning";
+                warning++;
+            }
+
+            continue;
+        }
+
+        // ===============================
+        // NORMAL EXPORTS
+        // ===============================
+
+        if (!exp.completed) {
+            exp.status = "Failed";
+            failed++;
+            continue;
+        }
+
+        if (exp.leftRows === 0) {
+            exp.status = "Success";
+            success++;
+            continue;
+        }
+
+        if (exp.leftRows === -1) {
+
+            if (
+                exp.declaredRows > 0 &&
+                exp.receivedRows >= exp.declaredRows * 0.95
+            ) {
+                exp.status = "Success";
+                success++;
+            } else {
+                exp.status = "Warning";
+                warning++;
+            }
+
+            continue;
+        }
+
+        if (exp.leftRows > 0) {
+            exp.status = "Warning";
+            warning++;
+            continue;
+        }
+
+        // fallback
+        exp.status = "Warning";
+        warning++;
+    }
+
+    return {
+        exports,
+        summary: {
+            total: exports.length,
+            success,
+            warning,
+            failed
+        }
+    };
+}
+
+
+// ===============================
+// TABLE RENDERING
+// ===============================
+
+function renderTable(data) {
+
+    resultsBody.innerHTML = "";
+
+    if (!data.exports.length) {
+        resultsBody.innerHTML = `
+            <tr>
+                <td colspan="7" class="empty">No exports found</td>
+            </tr>
+        `;
+        return;
+    }
+
+    for (let exp of data.exports) {
+
+        const row = document.createElement("tr");
+
+        if (exp.status === "Success") row.classList.add("success-row");
+        if (exp.status === "Warning") row.classList.add("warning-row");
+        if (exp.status === "Failed") row.classList.add("failed-row");
+
+        row.innerHTML = `
+            <td>${exp.name}</td>
+            <td>${exp.table}</td>
+            <td>${exp.declaredRows}</td>
+            <td>${exp.receivedRows}</td>
+            <td>${exp.portions}</td>
+            <td>${exp.leftRows}</td>
+            <td><span class="badge ${exp.status.toLowerCase()}">${exp.status}</span></td>
+        `;
+
+        resultsBody.appendChild(row);
+    }
+}
+
+
+// ===============================
+// SUMMARY
+// ===============================
+
+function updateSummary(data) {
+
+    totalExportsEl.textContent = data.summary.total;
+    successCountEl.textContent = data.summary.success;
+    warningCountEl.textContent = data.summary.warning;
+    failedCountEl.textContent = data.summary.failed;
+}
